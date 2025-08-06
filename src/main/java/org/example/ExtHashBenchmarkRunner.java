@@ -5,7 +5,7 @@ import org.openjdk.jmh.runner.RunnerException;
 import org.openjdk.jmh.runner.options.Options;
 import org.openjdk.jmh.runner.options.OptionsBuilder;
 
-public class BenchmarkRunner {
+public class ExtHashBenchmarkRunner {
     public static void main(String[] args) throws RunnerException {
         Options opt = new OptionsBuilder()
                 .include(ExtHashBenchmark.class.getSimpleName())

@@ -1,47 +1,49 @@
 package org.example;
 
 import org.openjdk.jmh.annotations.*;
-
-import java.util.ArrayList;
-import java.util.Random;
 import java.util.concurrent.TimeUnit;
 
+/**
+ * Бенчмарк вставки/чтения в extendible hash.
+ * Главное изменение: размер тестовых данных = 10_000.
+ */
 @BenchmarkMode(Mode.AverageTime)
 @OutputTimeUnit(TimeUnit.MILLISECONDS)
-@State(Scope.Thread)
+@Warmup(iterations = 3)
+@Measurement(iterations = 5)
+@Fork(1)
 public class ExtHashBenchmark {
-    private static final int keynum = 10000;
-    private ArrayList<String> inputData;
-    private ExtendibleHash<String, String> eh;
-    private final int bucketSize = 10;
-    private String key;
 
-    @Setup(Level.Trial)
-    public void setUp() {
-        inputData = new ArrayList<>();
-        for (int i = 0; i < keynum; i++) {
-            inputData.add("key" + i);
-        }
+    private static final int N = 10_000; // <-- требование: 10000
+    private static final int BUCKET_SIZE = 4;
 
-        eh = new ExtendibleHash<>(bucketSize);
-        for (String k : inputData) {
-            eh.put(k, k);
-        }
+    @State(Scope.Thread)
+    public static class HashState {
+        ExtendibleHash<Integer, Integer> hash;
 
-        Random random = new Random();
-        key = "key" + random.nextInt(keynum); // случайный ключ для поиска
-    }
-
-    @Benchmark
-    public void testBuildFullTable() {
-        ExtendibleHash<String, String> local = new ExtendibleHash<>(bucketSize);
-        for (String k : inputData) {
-            local.put(k, k);
+        @Setup(Level.Invocation)
+        public void setUp() {
+            hash = new ExtendibleHash<>(BUCKET_SIZE);
         }
     }
 
     @Benchmark
-    public void testLookupKey() {
-        eh.get(this.key);
+    public void insert10k(HashState s) {
+        for (int i = 0; i < N; i++) {
+            s.hash.put(i, i);
+        }
+    }
+
+    @Benchmark
+    public int insertThenRead10k(HashState s) {
+        for (int i = 0; i < N; i++) {
+            s.hash.put(i, i);
+        }
+        int acc = 0;
+        for (int i = 0; i < N; i++) {
+            Integer v = s.hash.get(i);
+            acc += (v == null ? 0 : v);
+        }
+        return acc;
     }
 }

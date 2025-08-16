@@ -5,6 +5,10 @@ import org.openjdk.jmh.runner.RunnerException;
 import org.openjdk.jmh.runner.options.Options;
 import org.openjdk.jmh.runner.options.OptionsBuilder;
 
+/**
+ * Запускатель JMH-бенчмарков.
+ * Никаких функциональных изменений — просто оставлен как есть.
+ */
 public class ExtHashBenchmarkRunner {
     public static void main(String[] args) throws RunnerException {
         Options opt = new OptionsBuilder()

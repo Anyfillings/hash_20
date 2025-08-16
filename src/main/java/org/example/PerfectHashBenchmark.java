@@ -11,7 +11,7 @@ import java.util.concurrent.TimeUnit;
 @OutputTimeUnit(TimeUnit.MILLISECONDS)
 @State(Scope.Thread)
 public class PerfectHashBenchmark {
-    private static final int keynum = 500; // уменьшенный объём
+    private static final int keynum = 10000; // уменьшенный объём
     private List<String> keys;
     private PerfectHash<String> ph;
     private String testKey;

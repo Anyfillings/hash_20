@@ -1,9 +1,16 @@
 package org.example;
 
+import java.io.Serializable;
 import java.util.HashMap;
 import java.util.Map;
 
-public class Bucket<K, V> {
+/**
+ * Бакет для extendible hash.
+ * Минимально изменён: добавлена сериализация.
+ */
+public class Bucket<K, V> implements Serializable {
+    private static final long serialVersionUID = 1L;
+
     private final Map<K, V> items;
     private int localDepth;
     private final int size;
@@ -14,22 +21,26 @@ public class Bucket<K, V> {
         this.items = new HashMap<>();
     }
 
-    public boolean isFull() {
-        return items.size() >= size;
-    }
-
     public int getLocalDepth() {
         return localDepth;
     }
 
-    public void incrementLocalDepth() {
-        localDepth++;
+    public void setLocalDepth(int localDepth) {
+        this.localDepth = localDepth;
     }
 
-    public boolean insert(K key, V value) {
-        if (isFull() && !items.containsKey(key)) return false;
+    public int getSize() {
+        return size;
+    }
+
+    public boolean isFull() {
+        return items.size() >= size;
+    }
+
+    public boolean put(K key, V value) {
+        boolean existed = items.containsKey(key);
         items.put(key, value);
-        return true;
+        return existed;
     }
 
     public V get(K key) {

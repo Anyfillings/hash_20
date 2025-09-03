@@ -1,180 +1,247 @@
 package org.example;
 
 import java.io.*;
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.*;
 
 /**
- * Extendible Hash (упрощённая реализация).
- * Доработки:
- *  - Сериализация для сохранения/загрузки
- *  - Методы saveToFile / loadFromFile
- *  - printStatus() для отладки (поддержка Main)
+ * Extendible Hash using per-bucket, per-mutation disk persistence via {@link ExtHashBucket}.
  *
- * Замечание: для сериализации K/V должны быть Serializable.
+ * API совместим с учебными заданиями: put/get/remove, printStatus, saveToFile/loadFromFile.
+ * Сохранение бакетов на диск выполняется самим ExtHashBucket при каждой мутации.
+ * Здесь мы сериализуем только "каркас" таблицы: глобальную глубину, параметры
+ * и соответствие слотов каталога -> имена файлов бакетов.
  */
-public class ExtendibleHash<K, V> implements Serializable {
+public class ExtendibleHash<K extends Serializable, V extends Serializable> implements Serializable {
     private static final long serialVersionUID = 1L;
 
-    // Директория хранит ссылки на бакеты; один и тот же бакет
-    // может повторяться в нескольких слотах (по префиксу).
-    private List<Bucket<K, V>> directory;
+    // ---- параметры ----
+    private final int bucketCapacity;
     private int globalDepth;
-    private final int bucketSize;
 
-    public ExtendibleHash(int bucketSize) {
-        this.bucketSize = bucketSize;
-        this.globalDepth = 1;
-        this.directory = new ArrayList<>();
-        // Изначально два бакета глубины 1
-        Bucket<K, V> b0 = new Bucket<>(1, bucketSize);
-        Bucket<K, V> b1 = new Bucket<>(1, bucketSize);
-        directory.add(b0); // 0
-        directory.add(b1); // 1
+    // ---- каталог ----
+    private transient Path storageDir;
+    private List<ExtHashBucket<K,V>> directory; // длина = 2^globalDepth, элементы — ссылки на бакеты
+    private final Map<String, ExtHashBucket<K,V>> uniqueBuckets = new LinkedHashMap<>();
+    private int nextBucketId = 0;
+
+    // ---------- ctors ----------
+
+    /**
+     * Удобный конструктор-обёртка: сохраняет совместимость со старыми вызовами new ExtendibleHash<>(depth)
+     * и задаёт вместимость бакета по умолчанию (например, 4).
+     */
+    public ExtendibleHash(int initialGlobalDepth) {
+        this(initialGlobalDepth, 4);
     }
 
-    private int mask(int depth) {
-        return (1 << depth) - 1;
+    /** Удобный конструктор с дефолтной директорией хранения. */
+    public ExtendibleHash(int initialGlobalDepth, int bucketCapacity) {
+        this(initialGlobalDepth, bucketCapacity, Path.of("ext-hash-data"));
     }
 
-    private int indexForKey(Object keyHash) {
-        // Берём hashCode и мапим по глобальной глубине
-        int h = keyHash.hashCode();
-        return h & mask(globalDepth);
+    public ExtendibleHash(int initialGlobalDepth, int bucketCapacity, Path storageDir) {
+        if (initialGlobalDepth < 0) throw new IllegalArgumentException("globalDepth < 0");
+        this.bucketCapacity = bucketCapacity;
+        this.globalDepth = initialGlobalDepth;
+        this.storageDir = Objects.requireNonNull(storageDir, "storageDir");
+        try { Files.createDirectories(storageDir); } catch (IOException ignored) {}
+
+        int dirSize = 1 << globalDepth;
+        this.directory = new ArrayList<>(Collections.nCopies(dirSize, null));
+
+        // один исходный бакет на все слоты
+        ExtHashBucket<K,V> b0 = newBucket(0);
+        for (int i = 0; i < dirSize; i++) directory.set(i, b0);
     }
 
-    public synchronized void put(K key, V value) {
-        int idx = indexForKey(key);
-        Bucket<K, V> bucket = directory.get(idx);
+    private ExtHashBucket<K,V> newBucket(int localDepth) {
+        String fileName = "bucket_" + (nextBucketId++) + ".bin";
+        ExtHashBucket<K,V> b = new ExtHashBucket<>(localDepth, bucketCapacity, storageDir, fileName);
+        uniqueBuckets.put(fileName, b);
+        return b;
+    }
+
+    private int dirIndexForHash(int h) {
+        int mask = (1 << globalDepth) - 1;
+        return h & mask;
+    }
+
+    private int hash(Object key) {
+        int h = key.hashCode();
+        h ^= (h >>> 16);
+        return h;
+    }
+
+    // ---------- операции ----------
+
+    public V put(K key, V value) {
+        int h = hash(key);
+        int idx = dirIndexForHash(h);
+        ExtHashBucket<K,V> bucket = directory.get(idx);
 
         if (!bucket.isFull() || bucket.containsKey(key)) {
-            bucket.put(key, value);
-            return;
+            return bucket.put(key, value); // сам персистит
         }
 
-        // Сплитим, если бакет полон и ключ новый
-        splitBucket(idx);
-        // После сплита пробуем снова
-        idx = indexForKey(key);
-        directory.get(idx).put(key, value);
+        // need split; возможно понадобится увеличивать каталог
+        split(idx);
+        // после сплита вставим
+        h = hash(key);
+        idx = dirIndexForHash(h);
+        return directory.get(idx).put(key, value);
     }
 
-    public synchronized V get(K key) {
-        Bucket<K, V> b = directory.get(indexForKey(key));
-        return b.get(key);
+    public V get(K key) {
+        int h = hash(key);
+        ExtHashBucket<K,V> bucket = directory.get(dirIndexForHash(h));
+        return bucket.get(key);
     }
 
-    public synchronized V remove(K key) {
-        Bucket<K, V> b = directory.get(indexForKey(key));
-        return b.remove(key);
+    public V remove(K key) {
+        int h = hash(key);
+        ExtHashBucket<K,V> bucket = directory.get(dirIndexForHash(h));
+        return bucket.remove(key); // сам персистит
     }
 
-    private void splitBucket(int bucketIndex) {
-        Bucket<K, V> oldBucket = directory.get(bucketIndex);
-        int oldLocalDepth = oldBucket.getLocalDepth();
-        int newLocalDepth = oldLocalDepth + 1;
+    public int sizeApprox() {
+        // суммируем уникальные бакеты
+        int sum = 0;
+        for (ExtHashBucket<K,V> b : new LinkedHashSet<>(directory)) {
+            sum += b.size();
+        }
+        return sum;
+    }
 
-        // Если локальная глубина после сплита превысит глобальную — удваиваем директорию
-        if (newLocalDepth > globalDepth) {
-            doubleDirectory();
+    private void split(int dirIndex) {
+        ExtHashBucket<K,V> oldB = directory.get(dirIndex);
+        int oldDepth = oldB.getLocalDepth();
+
+        // если локальная глубина == глобальной — расширяем каталог вдвое
+        if (oldDepth == globalDepth) {
+            int oldSize = 1 << globalDepth;
+            directory.addAll(new ArrayList<>(directory)); // дублируем ссылки
+            globalDepth++;
         }
 
-        // Создаём новый бакет
-        Bucket<K, V> newBucket = new Bucket<>(newLocalDepth, bucketSize);
-        oldBucket.setLocalDepth(newLocalDepth);
+        // новый бакет
+        ExtHashBucket<K,V> newB = newBucket(oldDepth + 1);
+        oldB.setLocalDepth(oldDepth + 1);
 
-        // Переназначаем слоты директории: все индексы, соответствующие новому биту,
-        // должны указывать на новый бакет.
-        int pattern = 1 << (newLocalDepth - 1);
-        for (int i = 0; i < directory.size(); i++) {
-            Bucket<K, V> b = directory.get(i);
-            if (b == oldBucket) {
-                if ((i & pattern) != 0) {
-                    directory.set(i, newBucket);
-                }
+        // маска для определения, какой слот должен указывать на новый бакет
+        int bit = 1 << oldDepth;
+        int dirSize = 1 << globalDepth;
+
+        for (int i = 0; i < dirSize; i++) {
+            if (directory.get(i) == oldB && ((i & bit) != 0)) {
+                directory.set(i, newB);
             }
         }
 
-        // Ре-хешим элементы старого бакета между oldBucket и newBucket
-        Map<K, V> items = oldBucket.getItems();
-        // Очистить старые
-        for (K k : items.keySet()) {
-            oldBucket.remove(k);
-        }
-        for (Map.Entry<K, V> e : items.entrySet()) {
-            int idx = indexForKey(e.getKey());
-            directory.get(idx).put(e.getKey(), e.getValue());
-        }
-    }
+        // перераспределяем элементы
+        Map<K,V> snapshot = oldB.snapshotItems();
+        oldB.clear(); // персистится
 
-    private void doubleDirectory() {
-        int oldSize = directory.size();
-        for (int i = 0; i < oldSize; i++) {
-            directory.add(directory.get(i));
-        }
-        globalDepth++;
-    }
-
-    public int getGlobalDepth() {
-        return globalDepth;
-    }
-
-    public int directorySize() {
-        return directory.size();
-    }
-
-    // ------------------------
-    //  Персистентность
-    // ------------------------
-    public void saveToFile(String path) throws IOException {
-        try (ObjectOutputStream out = new ObjectOutputStream(
-                new BufferedOutputStream(new FileOutputStream(path)))) {
-            out.writeObject(this);
-            out.flush();
+        for (Map.Entry<K,V> e : snapshot.entrySet()) {
+            K k = e.getKey();
+            V v = e.getValue();
+            int idx = dirIndexForHash(hash(k));
+            directory.get(idx).put(k, v);
         }
     }
 
-    @SuppressWarnings("unchecked")
-    public static <K, V> ExtendibleHash<K, V> loadFromFile(String path)
-            throws IOException, ClassNotFoundException {
-        Objects.requireNonNull(path, "path");
-        try (ObjectInputStream in = new ObjectInputStream(
-                new BufferedInputStream(new FileInputStream(path)))) {
-            return (ExtendibleHash<K, V>) in.readObject();
-        }
-    }
+    // ---------- отладка ----------
 
-    // ------------------------
-    //  Отладочный вывод состояния (для Main)
-    // ------------------------
-    /**
-     * Печатает параметры таблицы и список уникальных бакетов:
-     * их локальную глубину, какие слоты директории на них указывают и количество элементов.
-     */
-    public synchronized void printStatus() {
-        System.out.println("ExtendibleHash status:");
-        System.out.println("  globalDepth   = " + globalDepth);
-        System.out.println("  directorySize = " + directory.size());
+    public void printStatus() {
+        System.out.println("ExtendibleHash{globalDepth=" + globalDepth +
+                ", uniqueBuckets=" + new LinkedHashSet<>(directory).size() +
+                ", approxSize=" + sizeApprox() + "}");
 
-        // Сгруппировать слоты директории по уникальным объектам Bucket
-        Map<Bucket<K, V>, List<Integer>> groups = new LinkedHashMap<>();
+        // сгруппируем слоты по объекту бакета
+        Map<ExtHashBucket<K,V>, List<Integer>> groups = new LinkedHashMap<>();
         for (int i = 0; i < directory.size(); i++) {
-            Bucket<K, V> b = directory.get(i);
+            ExtHashBucket<K,V> b = directory.get(i);
             groups.computeIfAbsent(b, k -> new ArrayList<>()).add(i);
         }
-
         int idx = 0;
-        for (Map.Entry<Bucket<K, V>, List<Integer>> e : groups.entrySet()) {
-            Bucket<K, V> b = e.getKey();
-            int count = b.getItems().size();
+        for (Map.Entry<ExtHashBucket<K,V>, List<Integer>> e : groups.entrySet()) {
+            ExtHashBucket<K,V> b = e.getKey();
             System.out.println("  bucket#" + idx
+                    + " file=" + b.getFileName()
                     + " localDepth=" + b.getLocalDepth()
                     + " slots=" + e.getValue()
-                    + " items=" + count);
+                    + " items=" + b.size());
             idx++;
         }
+    }
+
+    // ---------- сохранение/загрузка "каркаса" ----------
+
+    public void saveToFile(String metaFilePath) throws IOException {
+        // соберём уникальные бакеты и их имена
+        Map<ExtHashBucket<K,V>, String> b2name = new IdentityHashMap<>();
+        List<String> dirNames = new ArrayList<>(directory.size());
+
+        for (ExtHashBucket<K,V> b : directory) {
+            b2name.computeIfAbsent(b, __ -> b.getFileName());
+            dirNames.add(b.getFileName());
+        }
+
+        Meta<K,V> meta = new Meta<>();
+        meta.bucketCapacity = this.bucketCapacity;
+        meta.globalDepth = this.globalDepth;
+        meta.storageDir = this.storageDir.toString();
+        meta.dirFileNames = dirNames;
+        meta.nextBucketId = this.nextBucketId;
+
+        try (ObjectOutputStream oos = new ObjectOutputStream(new FileOutputStream(metaFilePath))) {
+            oos.writeObject(meta);
+        }
+    }
+
+    public static <K extends Serializable, V extends Serializable>
+    ExtendibleHash<K,V> loadFromFile(String metaFilePath) throws IOException {
+        try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream(metaFilePath))) {
+            @SuppressWarnings("unchecked")
+            Meta<K,V> meta = (Meta<K,V>) ois.readObject();
+
+            ExtendibleHash<K,V> h = new ExtendibleHash<>(meta.globalDepth, meta.bucketCapacity, Path.of(meta.storageDir));
+            h.directory.clear();
+            h.directory.addAll(Collections.nCopies(1 << h.globalDepth, null));
+            h.uniqueBuckets.clear();
+            h.nextBucketId = meta.nextBucketId;
+
+            // загрузим/свяжем все бакеты, чтобы слоты ссылались на одни и те же объекты
+            Map<String, ExtHashBucket<K,V>> cache = new HashMap<>();
+            for (int i = 0; i < meta.dirFileNames.size(); i++) {
+                String name = meta.dirFileNames.get(i);
+                ExtHashBucket<K,V> b = cache.get(name);
+                if (b == null) {
+                    try {
+                        b = ExtHashBucket.load(h.storageDir, name);
+                        b.rebindStorageDir(h.storageDir);
+                    } catch (ClassNotFoundException e) {
+                        throw new IOException("Bucket class not found while loading", e);
+                    }
+                    cache.put(name, b);
+                }
+                h.directory.set(i, b);
+                h.uniqueBuckets.put(name, b);
+            }
+            return h;
+        } catch (ClassNotFoundException e) {
+            throw new IOException("Meta class not found", e);
+        }
+    }
+
+    // "каркас" состояния для сериализации
+    private static class Meta<K,V> implements Serializable {
+        private static final long serialVersionUID = 1L;
+        int bucketCapacity;
+        int globalDepth;
+        String storageDir;
+        List<String> dirFileNames;
+        int nextBucketId;
     }
 }
